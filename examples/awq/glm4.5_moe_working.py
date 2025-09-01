@@ -53,9 +53,18 @@ def tokenize(sample):
 recipe = [
     AWQModifier(
         ignore=["lm_head", "re:.*mlp.gate$", "re:.*mlp.shared_expert_gate$"],
-        scheme="W4A16",
-        targets=["Linear"],
-        group_size=128,
+        config_groups={
+            "group_0": {
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": True,
+                    "strategy": "group",
+                    "group_size": 128,
+                },
+                "targets": ["Linear"],
+            }
+        },
     ),
 ]
 
