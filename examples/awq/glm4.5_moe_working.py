@@ -1,3 +1,4 @@
+import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -52,7 +53,7 @@ def tokenize(sample):
 # NOTE: vllm currently does not support asym MoE, using symmetric here
 recipe = [
     AWQModifier(
-        ignore=["lm_head", "re:.*mlp.gate$", "re:.*mlp.shared_expert_gate$"],
+        ignore=["lm_head", "re:.*mlp\\..*_proj$"],
         config_groups={
             "group_0": {
                 "weights": {
