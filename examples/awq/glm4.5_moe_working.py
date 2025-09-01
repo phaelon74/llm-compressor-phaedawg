@@ -69,15 +69,15 @@ oneshot(
 )
 
 # Confirm generations of the quantized model look sane.
-print("\n\n")
-print("========== SAMPLE GENERATION ==============")
-dispatch_for_generation(model)
-input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
-    model.device
-)
-output = model.generate(input_ids, max_new_tokens=100)
-print(tokenizer.decode(output[0]))
-print("==========================================\n\n")
+#print("\n\n")
+#print("========== SAMPLE GENERATION ==============")
+#dispatch_for_generation(model)
+#input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
+#    model.device
+#)
+#output = model.generate(input_ids, max_new_tokens=100)
+#print(tokenizer.decode(output[0]))
+#print("==========================================\n\n")
 
 # Save to disk compressed.
 SAVE_DIR = "/home/akitzke/models/TheHouseOfTheDude/GLM-Steam-106B-A12B-v1_W4A16"
