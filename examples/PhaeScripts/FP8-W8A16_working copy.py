@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
 from llmcompressor.utils import dispatch_for_generation
+from compressed_tensors.quantization import QuantizationScheme, QuantizationArgs
 
 # =========================
 # Model
@@ -71,8 +72,27 @@ ds = ds.map(
 # =========================
 # Quantization recipe
 # =========================
+weight_args = QuantizationArgs(
+    num_bits=8,
+    type="int",
+    symmetric=False,
+    strategy="group",
+    group_size=128,
+)
+
+quant_scheme = QuantizationScheme(
+    targets=["Linear"],
+    weights=weight_args,
+    input_activations=None,
+    output_activations=None,
+)
+
 recipe = [
-    AWQModifier(ignore=["lm_head"], scheme="W8A16", targets=["Linear"]),
+    AWQModifier(
+        ignore=["lm_head"],
+        targets=["Linear"],
+        config_groups={"group_0": quant_scheme},
+    ),
 ]
 
 # =========================
