@@ -8,7 +8,7 @@ from llmcompressor.utils import dispatch_for_generation
 # =========================
 # Model
 # =========================
-MODEL_ID = "/home/akitzke/models/TheDrummer/Behemoth-X-123B-v2/"
+MODEL_ID = "/home/akitzke/models/TheDrummer/Behemoth-R1-123B-v2/"
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -72,7 +72,7 @@ ds = ds.map(
 # Quantization recipe
 # =========================
 recipe = [
-    AWQModifier(ignore=["lm_head"], scheme="W4A16_ASYM", targets=["Linear"]),
+    AWQModifier(ignore=["lm_head"], scheme="W8A16", targets=["Linear"]),
 ]
 
 # =========================
@@ -99,7 +99,7 @@ oneshot(
 # =========================
 # Save compressed model
 # =========================
-SAVE_DIR = "/home/akitzke/models/TheHouseOfTheDude/Behemoth-X-123B-v2-W4A16-ASYM/"
+SAVE_DIR = "/home/akitzke/models/TheHouseOfTheDude/Behemoth-R1-123B-v2_W8A16/"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
 
