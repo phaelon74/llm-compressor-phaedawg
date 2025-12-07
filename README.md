@@ -54,6 +54,7 @@ Some of the exciting new features include:
 * Simple PTQ
 * GPTQ
 * AWQ
+* FlexQ (6-bit quantization)
 * SmoothQuant
 * SparseGPT
 * AutoRound
@@ -80,6 +81,7 @@ Applying quantization with `llmcompressor`:
 * [Weight only quantization to `fp4`](examples/quantization_w4a16_fp4/llama3_example.py)
 * [Weight only quantization to `int4` using GPTQ](examples/quantization_w4a16/README.md)
 * [Weight only quantization to `int4` using AWQ](examples/awq/README.md)
+* [6-bit quantization using FlexQ](examples/flexq/README.md)
 * [Weight only quantization to `int4` using AutoRound](examples/autoround/README.md)
 * [Quantizing MoE LLMs](examples/quantizing_moe/README.md)
 * [Quantizing Vision-Language Models](examples/multimodal_vision/README.md)
