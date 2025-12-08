@@ -220,9 +220,19 @@ class FlexQModifier(Modifier, QuantizationMixin):
 
         # Quantize and pack 6-bit weights
         if self._num_bits == 6:
+            # First, ensure all weights are calibrated (scales computed)
+            logger.info("FlexQ: Finalizing weight calibration...")
+            named_modules = list(
+                match_named_modules(state.model, self.resolved_targets, self.ignore)
+            )
+            for _, module in tqdm(named_modules, desc="Finalizing calibration"):
+                update_weight_zp_scale(module)
+            
+            # Now quantize weights to INT6 (actually replace FP16 with quantized values)
             logger.info("FlexQ: Quantizing weights to INT6...")
             self._quantize_weights(state.model)
             
+            # Pack quantized weights for efficient storage
             logger.info("FlexQ: Packing 6-bit weights for efficient storage...")
             self._pack_weights(state.model)
 
@@ -340,29 +350,63 @@ class FlexQModifier(Modifier, QuantizationMixin):
             if quantization_status != QuantizationStatus.FROZEN:
                 continue
             
-            # Get weight and scales
+            # Get weight and scales - ensure weight is materialized
             if not hasattr(module, "weight") or module.weight is None:
                 continue
             
-            weight = module.weight.data
+            # Ensure weight is materialized (not on meta device)
+            try:
+                weight = module.weight.data
+                if weight.device.type == "meta":
+                    # Try to materialize the weight
+                    from compressed_tensors.utils import align_module_device
+                    with align_module_device(module):
+                        weight = module.weight.data
+                        if weight.device.type == "meta":
+                            logger.debug(f"Skipping {name}: weight is on meta device and cannot be materialized")
+                            continue
+            except Exception as e:
+                logger.debug(f"Skipping {name}: cannot access weight - {e}")
+                continue
+            
             scales = self._get_scales(module)
             zero_points = self._get_zero_points(module)
             
             if scales is None:
-                logger.warning(f"Skipping {name}: no scales found for quantization")
+                logger.debug(f"Skipping {name}: no scales found for quantization")
                 continue
             
+            # Ensure scales are materialized
             try:
-                # Quantize the weights
+                if scales.device.type == "meta":
+                    from compressed_tensors.utils import align_module_device
+                    with align_module_device(module):
+                        scales = self._get_scales(module)
+                        if scales is None or scales.device.type == "meta":
+                            logger.debug(f"Skipping {name}: scales are on meta device")
+                            continue
+            except:
+                pass
+            
+            try:
+                # Quantize the weights to INT6
                 quantized_weight = self._quantize_weight_tensor(
                     weight, scales, zero_points, weights_args
                 )
                 
                 # Replace the weight with quantized version
-                module.weight.data = quantized_weight
+                # This is the crucial step - actually replacing FP16 weights with quantized values
+                with torch.no_grad():
+                    module.weight.data = quantized_weight
+                
                 quantized_count += 1
                 
-                logger.debug(f"Quantized weights for {name}: {weight.shape}, dtype={weight.dtype} -> dtype={quantized_weight.dtype}")
+                if quantized_count <= 3:  # Log first 3 for debugging
+                    logger.info(
+                        f"Quantized {name}: shape={weight.shape}, "
+                        f"original_range=[{weight.min():.4f}, {weight.max():.4f}], "
+                        f"quantized_range=[{quantized_weight.min():.4f}, {quantized_weight.max():.4f}]"
+                    )
             except Exception as e:
                 logger.error(f"Failed to quantize weights for {name}: {e}", exc_info=True)
                 continue
