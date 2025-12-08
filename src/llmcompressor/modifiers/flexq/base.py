@@ -200,8 +200,11 @@ class FlexQModifier(Modifier, QuantizationMixin):
             # Quantize weights after each sequential segment is calibrated
             # This is crucial - quantize immediately after calibration while scales are available
             if self._num_bits == 6:
-                logger.debug("FlexQ: Quantizing weights for current sequential segment...")
-                self._quantize_weights_for_segment(state.model, kwargs.get("segment", None))
+                # Get segment from event data or kwargs
+                segment = kwargs.get("segment", None) or getattr(event, "segment", None)
+                logger.info(f"FlexQ: SEQUENTIAL_EPOCH_END event received - Quantizing weights for segment...")
+                quantized_count = self._quantize_weights_for_segment(state.model, segment)
+                logger.info(f"FlexQ: Quantized {quantized_count} weight tensors in this segment")
 
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
             # Perform sensitivity analysis if enabled
@@ -387,8 +390,7 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 logger.debug(f"Failed to quantize weights for {name}: {e}")
                 continue
         
-        if quantized_count > 0:
-            logger.debug(f"FlexQ: Quantized {quantized_count} weight tensors in segment")
+        return quantized_count
     
     def _quantize_weights(self, model: Module):
         """
