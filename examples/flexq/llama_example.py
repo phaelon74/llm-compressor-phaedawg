@@ -185,16 +185,43 @@ from compressed_tensors.utils import match_named_modules
 
 # Check quantization status of quantized modules
 quantized_modules = list(match_named_modules(model, ["Linear"], ["lm_head"]))
+packed_count = 0
 for name, module in quantized_modules[:3]:  # Check first 3 modules
     if hasattr(module, "quantization_status"):
         print(f"{name}: quantization_status = {module.quantization_status}")
+    if hasattr(module, "_flexq_packed_weight"):
+        packed_count += 1
+        print(f"{name}: has packed weights (shape: {module._flexq_packed_weight.shape})")
 
-model.save_pretrained(SAVE_DIR, save_compressed=True)
+print(f"\nFound {packed_count} modules with packed weights out of {len(quantized_modules)} total")
+
+# Hook into state_dict to use packed weights when saving
+# compressed-tensors might access weights directly, so we need to temporarily
+# replace the weight tensors with packed versions
+original_weights = {}
+packed_modules = []
+
+for name, module in model.named_modules():
+    if hasattr(module, "_flexq_packed_weight") and hasattr(module, "weight"):
+        original_weights[name] = module.weight.data.clone()
+        # Temporarily replace weight with packed version
+        module.weight.data = module._flexq_packed_weight
+        packed_modules.append((name, module))
+        print(f"Replaced weight for {name} with packed version: {original_weights[name].shape} -> {module._flexq_packed_weight.shape}")
+
+try:
+    # Save with packed weights
+    model.save_pretrained(SAVE_DIR, save_compressed=True)
+finally:
+    # Restore original weights for inference
+    for name, module in packed_modules:
+        if name in original_weights:
+            module.weight.data = original_weights[name]
+            print(f"Restored original weight for {name}")
+
 tokenizer.save_pretrained(SAVE_DIR)
 
 print(f"Model saved to {SAVE_DIR}")
-print(f"\nNote: If the model size is larger than expected (~6GB for W6),")
-print("this may indicate that compressed-tensors doesn't fully support")
-print("6-bit weight packing. FlexQ uses custom bit-level packing which")
-print("may require additional implementation.")
+print(f"\nNote: FlexQ 6-bit weights have been packed for efficient storage.")
+print("The model should be approximately 6GB for an 8B parameter model at W6.")
 

@@ -53,15 +53,17 @@ Based on the FlexQ paper (https://arxiv.org/html/2508.04405v2):
    - Custom CUDA kernels for W6A6 and W6A8
    - Fused dequantization in GEMM kernels
 
-### 4. What's Missing?
+### 4. Implementation Status
 
 The current implementation:
 - ✅ Uses fine-grained group quantization (group_size=128)
 - ✅ Configures 6-bit weights and 8-bit activations
 - ✅ Calibrates weights during forward passes
-- ❌ May not properly pack weights to 6-bit format
-- ❌ Doesn't use FlexQ's custom bit-level packing
-- ❌ Doesn't include FlexQ's custom CUDA kernels
+- ✅ **NEW**: Implements 6-bit weight packing (4 INT6 values → 3 bytes)
+- ✅ **NEW**: Packs weights after calibration in `FlexQModifier.on_end`
+- ✅ **NEW**: Example script uses packed weights when saving
+- ❌ Doesn't include FlexQ's custom CUDA kernels (inference still uses standard kernels)
+- ❌ Unpacking logic exists but not yet integrated into model loading
 
 ### 5. Recommendations
 
@@ -89,10 +91,42 @@ The current implementation:
    - Or implement custom 6-bit packing based on FlexQ's paper
    - Or wait for compressed-tensors to add full 6-bit support
 
+## Implementation Details
+
+### 6-bit Weight Packing
+
+**Packing Strategy:**
+- 4 INT6 values (24 bits) → 3 bytes exactly
+- Efficient byte-aligned storage
+- Packing function: `pack_int6_weights()` in `src/llmcompressor/modifiers/flexq/packing.py`
+
+**Process:**
+1. After calibration, `FlexQModifier.on_end()` calls `_pack_weights()`
+2. For each quantized module:
+   - Re-quantizes weights to INT6 using scales/zero_points
+   - Packs 4 INT6 values into 3 bytes
+   - Stores packed weights and metadata
+3. During save, example script temporarily replaces weights with packed versions
+4. After save, original weights are restored for inference
+
+**Storage Format:**
+- Packed weights stored as `uint8` tensors
+- Metadata includes: original_shape, num_elements, pad_size, symmetric flag
+- Scales and zero_points stored separately by compressed-tensors
+
+### Loading Packed Models
+
+**TODO:** Implement unpacking logic when loading models:
+- Detect packed weights (check for `_flexq_packing_metadata`)
+- Unpack using `unpack_int6_weights()`
+- Restore original quantized format for inference
+
 ## Next Steps
 
-1. Verify if weights are actually quantized to 6-bit integers
-2. Check if compressed-tensors has 6-bit packing support
-3. Consider implementing custom packing if needed
-4. Test with a smaller model first to verify quantization works correctly
+1. ✅ Implemented 6-bit weight packing
+2. ✅ Integrated packing into FlexQModifier
+3. ✅ Updated example script to use packed weights
+4. ⏳ Test that packed model size is correct (~6GB for 8B model)
+5. ⏳ Implement unpacking logic for model loading
+6. ⏳ Verify inference works correctly with packed weights
 

@@ -29,6 +29,7 @@ from llmcompressor.modifiers.flexq.mappings import (
     FlexQMapping,
     get_layer_mappings_from_architecture,
 )
+from llmcompressor.modifiers.flexq.packing import pack_int6_weights
 from llmcompressor.modifiers.quantization.calibration import (
     update_weight_global_scale,
     update_weight_zp_scale,
@@ -104,6 +105,7 @@ class FlexQModifier(Modifier, QuantizationMixin):
     _num_bits: int = PrivateAttr(default=None)
     _sensitive_layers: set[str] = PrivateAttr(default_factory=set)
     _calibration_data: list[torch.Tensor] = PrivateAttr(default_factory=list)
+    _packed_weights: dict[str, tuple[torch.Tensor, dict]] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_flexq_after(model: "FlexQModifier") -> "FlexQModifier":
@@ -204,11 +206,12 @@ class FlexQModifier(Modifier, QuantizationMixin):
 
     def on_end(self, state: State, event: Event, **kwargs):
         """
-        Finish calibration by updating quantization parameters.
+        Finish calibration by updating quantization parameters and packing 6-bit weights.
         
         Note: FlexQ does NOT use AWQ-style smoothing. It uses fine-grained
-        group quantization directly. The compressed-tensors system handles
-        the actual quantization and storage format.
+        group quantization directly. After calibration, we pack 6-bit weights
+        into an efficient format since compressed-tensors doesn't natively
+        support 6-bit packing.
         """
         self.ended_ = True
 
@@ -217,6 +220,11 @@ class FlexQModifier(Modifier, QuantizationMixin):
         # QuantizationArgs configuration (strategy="group", group_size=128)
         # Fine-grained group quantization scales are computed during calibration
         QuantizationMixin.end_calibration(self, state.model)
+
+        # Pack 6-bit weights for efficient storage
+        if self._num_bits == 6:
+            logger.info("FlexQ: Packing 6-bit weights for efficient storage...")
+            self._pack_weights(state.model)
 
         logger.info("FlexQ: Calibration complete")
 
@@ -302,4 +310,71 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 f"Sensitive layers (should use 8-bit activations): "
                 f"{list(self._sensitive_layers)[:5]}..."  # Show first 5
             )
+
+    def _pack_weights(self, model: Module):
+        """
+        Pack 6-bit quantized weights into efficient format.
+        
+        Since compressed-tensors doesn't natively support 6-bit packing,
+        we manually pack the weights and store them. The packed weights
+        will be used when saving the model.
+        
+        :param model: The model with quantized weights
+        """
+        from compressed_tensors.quantization import QuantizationStatus
+        from compressed_tensors.utils import getattr_chain
+        
+        named_modules = list(
+            match_named_modules(model, self.resolved_targets, self.ignore)
+        )
+        
+        for name, module in tqdm(named_modules, desc="Packing 6-bit weights"):
+            # Check if this module has 6-bit quantization
+            weights_args = getattr_chain(module, "quantization_scheme.weights", None)
+            if weights_args is None or weights_args.num_bits != 6:
+                continue
+            
+            # Check if quantization is frozen (calibration complete)
+            if getattr(module, "quantization_status", None) != QuantizationStatus.FROZEN:
+                logger.warning(f"Skipping {name}: quantization not frozen")
+                continue
+            
+            # Get quantized weight, scales, and zero points
+            if not hasattr(module, "weight") or module.weight is None:
+                continue
+            
+            weight = module.weight.data
+            scales = getattr(module, "weight_scale", None)
+            zero_points = getattr(module, "weight_zero_point", None)
+            
+            if scales is None:
+                logger.warning(f"Skipping {name}: no weight_scale found")
+                continue
+            
+            # Pack the weights
+            try:
+                # Get group_size from quantization scheme
+                weights_args = getattr_chain(module, "quantization_scheme.weights", None)
+                group_size = getattr(weights_args, "group_size", None) if weights_args else None
+                if group_size is None or group_size <= 0:
+                    group_size = self.w_group_size
+                
+                packed_weight, metadata = pack_int6_weights(weight, scales, zero_points, group_size)
+                self._packed_weights[name] = (packed_weight, metadata)
+                
+                # Replace the weight with packed version
+                # Store original shape and other metadata as module attributes
+                module._flexq_packed_weight = packed_weight
+                module._flexq_packing_metadata = metadata
+                module._flexq_original_weight_shape = weight.shape
+                module._flexq_weight_scale = scales
+                if zero_points is not None:
+                    module._flexq_weight_zero_point = zero_points
+                
+                logger.debug(f"Packed weights for {name}: {weight.shape} -> {packed_weight.shape}")
+            except Exception as e:
+                logger.error(f"Failed to pack weights for {name}: {e}")
+                continue
+        
+        logger.info(f"FlexQ: Packed {len(self._packed_weights)} weight tensors")
 
