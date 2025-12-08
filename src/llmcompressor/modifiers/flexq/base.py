@@ -29,8 +29,12 @@ from llmcompressor.modifiers.flexq.mappings import (
     FlexQMapping,
     get_layer_mappings_from_architecture,
 )
-from llmcompressor.modifiers.quantization.calibration import update_weight_zp_scale
+from llmcompressor.modifiers.quantization.calibration import (
+    update_weight_global_scale,
+    update_weight_zp_scale,
+)
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
+from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 
 __all__ = ["FlexQModifier"]
 
@@ -165,8 +169,21 @@ class FlexQModifier(Modifier, QuantizationMixin):
         # Start calibration hooks
         QuantizationMixin.start_calibration(self, state.model)
 
-        # Note: Quantization is enabled during calibration by QuantizationMixin
-        # We'll disable it temporarily for sensitivity analysis if needed
+        # Update global scales for group quantization (similar to QuantizationModifier)
+        named_modules = list(
+            match_named_modules(state.model, self.resolved_targets, self.ignore)
+        )
+        for _, module in tqdm(named_modules, desc="Updating global scales"):
+            update_weight_global_scale(module)
+
+        # Update fused layer global scales (for attention/MLP layers)
+        for module in tqdm(state.model.modules(), desc="Fusing global scales"):
+            update_fused_layer_weight_global_scales(module)
+
+        # Calibrate weights
+        for _, module in tqdm(named_modules, desc="Calibrating weights"):
+            update_weight_zp_scale(module)
+
         logger.info("FlexQ: Starting calibration and sensitivity analysis...")
 
     def on_event(self, state: State, event: Event, **kwargs):
@@ -188,20 +205,17 @@ class FlexQModifier(Modifier, QuantizationMixin):
     def on_end(self, state: State, event: Event, **kwargs):
         """
         Finish calibration by updating quantization parameters.
+        
+        Note: FlexQ does NOT use AWQ-style smoothing. It uses fine-grained
+        group quantization directly. The compressed-tensors system handles
+        the actual quantization and storage format.
         """
         self.ended_ = True
 
-        # Update weight scales and zero points
-        # The compressed-tensors system handles the actual quantization
+        # End calibration - this freezes quantization and removes observers
+        # The compressed-tensors system handles quantization based on the
+        # QuantizationArgs configuration (strategy="group", group_size=128)
         # Fine-grained group quantization scales are computed during calibration
-        logger.info("FlexQ: Calibrating weights with fine-grained group quantization...")
-        for _, module in tqdm(
-            match_named_modules(state.model, self.resolved_targets, self.ignore),
-            desc="Calibrating weights",
-        ):
-            update_weight_zp_scale(module)
-
-        # End calibration
         QuantizationMixin.end_calibration(self, state.model)
 
         logger.info("FlexQ: Calibration complete")

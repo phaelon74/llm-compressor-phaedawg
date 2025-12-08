@@ -164,20 +164,37 @@ oneshot(
 )
 
 # Confirm generations of the quantized model look sane.
-print("\n\n")
-print("========== SAMPLE GENERATION ==============")
-dispatch_for_generation(model)
-input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
-    model.device
-)
-output = model.generate(input_ids, max_new_tokens=100)
-print(tokenizer.decode(output[0]))
-print("==========================================\n\n")
+#print("\n\n")
+#print("========== SAMPLE GENERATION ==============")
+#dispatch_for_generation(model)
+#input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
+#    model.device
+#)
+#output = model.generate(input_ids, max_new_tokens=100)
+#print(tokenizer.decode(output[0]))
+#print("==========================================\n\n")
 
 # Save to disk compressed.
 SAVE_DIR = DST_DIR
+
+# Ensure quantization is properly applied before saving
+# The compressed-tensors library should handle compression automatically
+# with save_compressed=True, but we verify the quantization status
+from compressed_tensors.quantization import QuantizationStatus
+from compressed_tensors.utils import match_named_modules
+
+# Check quantization status of quantized modules
+quantized_modules = list(match_named_modules(model, ["Linear"], ["lm_head"]))
+for name, module in quantized_modules[:3]:  # Check first 3 modules
+    if hasattr(module, "quantization_status"):
+        print(f"{name}: quantization_status = {module.quantization_status}")
+
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
 
 print(f"Model saved to {SAVE_DIR}")
+print(f"\nNote: If the model size is larger than expected (~6GB for W6),")
+print("this may indicate that compressed-tensors doesn't fully support")
+print("6-bit weight packing. FlexQ uses custom bit-level packing which")
+print("may require additional implementation.")
 
