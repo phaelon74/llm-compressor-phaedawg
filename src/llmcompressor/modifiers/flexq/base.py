@@ -225,11 +225,16 @@ class FlexQModifier(Modifier, QuantizationMixin):
         """
         self.ended_ = True
 
-        # Pack 6-bit weights for efficient storage
-        # Quantization already happened during sequential pipeline via SEQUENTIAL_EPOCH_END
+        # Packing already happened during sequential pipeline via SEQUENTIAL_EPOCH_END
+        # Just verify we have packed weights
         if self._num_bits == 6:
-            logger.info("FlexQ: Packing 6-bit weights for efficient storage...")
-            self._pack_weights(state.model)
+            packed_count = len(self._packed_weights)
+            logger.info(f"FlexQ: Packed {packed_count} weight tensors during sequential pipeline")
+            
+            # Store packed weights on model for access during save
+            if not hasattr(state.model, "_flexq_packed_weights"):
+                state.model._flexq_packed_weights = {}
+            state.model._flexq_packed_weights.update(self._packed_weights)
 
         # End calibration - this freezes quantization and removes observers
         # Do this AFTER quantization so scales are still available
@@ -384,6 +389,33 @@ class FlexQModifier(Modifier, QuantizationMixin):
                     quantized_weight = quantized_weight.to(dtype=weight.dtype, device=weight.device)
                     # Use copy_ to preserve the Parameter type and avoid "incompatible tensor type" error
                     module.weight.data.copy_(quantized_weight)
+                
+                # Pack weights immediately while they're materialized and scales are available
+                try:
+                    scales = self._get_scales(module)
+                    zero_points = self._get_zero_points(module)
+                    if scales is not None:
+                        # Pack this weight immediately
+                        weights_args = getattr_chain(module, "quantization_scheme.weights", None)
+                        group_size = getattr(weights_args, "group_size", None) if weights_args else self.w_group_size
+                        if group_size is None or group_size <= 0:
+                            group_size = self.w_group_size
+                        
+                        weight_cpu = quantized_weight.cpu()
+                        scales_cpu = scales.cpu() if scales.device.type != "cpu" else scales
+                        zero_points_cpu = zero_points.cpu() if zero_points is not None and zero_points.device.type != "cpu" else zero_points
+                        
+                        packed_weight, metadata = pack_int6_weights(weight_cpu, scales_cpu, zero_points_cpu, group_size)
+                        self._packed_weights[name] = (packed_weight, metadata)
+                        
+                        # Store metadata
+                        module._flexq_packing_metadata = {
+                            "original_shape": tuple(quantized_weight.shape),
+                            "symmetric": zero_points is None,
+                        }
+                        module._flexq_has_packed_weights = True
+                except Exception as e:
+                    logger.debug(f"Failed to pack {name} immediately: {e}")
                 
                 quantized_count += 1
             except Exception as e:
@@ -673,7 +705,19 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 skipped_no_weight += 1
                 continue
             
-            weight = module.weight.data
+            # Materialize weight if it's on meta device
+            try:
+                from compressed_tensors.utils import align_module_device
+                with align_module_device(module):
+                    weight = module.weight.data
+                    if weight.device.type == "meta":
+                        logger.debug(f"Skipping {name}: weight is on meta device and cannot be materialized")
+                        skipped_no_weight += 1
+                        continue
+            except Exception as e:
+                logger.debug(f"Skipping {name}: cannot materialize weight - {e}")
+                skipped_no_weight += 1
+                continue
             
             # Try to get scales - compressed-tensors stores them via update_offload_parameter
             # They might be stored as buffers, attributes, or in a special offload structure
@@ -755,7 +799,12 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 if group_size is None or group_size <= 0:
                     group_size = self.w_group_size
                 
-                # Ensure weight is on CPU for packing (to avoid device issues)
+                # Ensure weight and scales are on CPU for packing (to avoid device issues)
+                # Skip if still on meta device (materialization failed)
+                if weight.device.type == "meta" or scales.device.type == "meta":
+                    logger.debug(f"Skipping {name}: weight or scales still on meta device after materialization attempt")
+                    continue
+                
                 weight_cpu = weight.cpu() if weight.device.type != "cpu" else weight
                 scales_cpu = scales.cpu() if scales.device.type != "cpu" else scales
                 zero_points_cpu = zero_points.cpu() if zero_points is not None and zero_points.device.type != "cpu" else zero_points
