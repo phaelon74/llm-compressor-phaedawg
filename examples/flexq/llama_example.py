@@ -13,6 +13,11 @@ Configuration:
 import os
 from pathlib import Path
 
+# Suppress tokenizers parallelism warnings when using DataLoader with multiple workers
+# This is safe - the warnings occur because tokenizers detect forking after parallelism
+# is enabled, but it doesn't affect functionality
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
