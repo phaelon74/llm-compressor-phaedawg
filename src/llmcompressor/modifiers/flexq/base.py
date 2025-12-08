@@ -206,23 +206,23 @@ class FlexQModifier(Modifier, QuantizationMixin):
 
     def on_end(self, state: State, event: Event, **kwargs):
         """
-        Finish calibration by updating quantization parameters and packing 6-bit weights.
+        Finish calibration by quantizing weights to INT6 and packing them.
         
         Note: FlexQ does NOT use AWQ-style smoothing. It uses fine-grained
-        group quantization directly. After calibration, we pack 6-bit weights
-        into an efficient format since compressed-tensors doesn't natively
-        support 6-bit packing.
+        group quantization directly. After calibration, we:
+        1. Quantize weights to INT6 using the computed scales
+        2. Pack quantized weights into efficient format
         """
         self.ended_ = True
 
         # End calibration - this freezes quantization and removes observers
-        # The compressed-tensors system handles quantization based on the
-        # QuantizationArgs configuration (strategy="group", group_size=128)
-        # Fine-grained group quantization scales are computed during calibration
         QuantizationMixin.end_calibration(self, state.model)
 
-        # Pack 6-bit weights for efficient storage
+        # Quantize and pack 6-bit weights
         if self._num_bits == 6:
+            logger.info("FlexQ: Quantizing weights to INT6...")
+            self._quantize_weights(state.model)
+            
             logger.info("FlexQ: Packing 6-bit weights for efficient storage...")
             self._pack_weights(state.model)
 
@@ -311,6 +311,200 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 f"{list(self._sensitive_layers)[:5]}..."  # Show first 5
             )
 
+    def _quantize_weights(self, model: Module):
+        """
+        Quantize weights to INT6 using the computed scales.
+        
+        This actually converts FP16 weights to quantized INT6 values.
+        The quantized weights are stored back in the module's weight parameter.
+        
+        :param model: The model with calibrated quantization scales
+        """
+        from compressed_tensors.quantization import QuantizationStatus
+        from compressed_tensors.utils import getattr_chain
+        
+        named_modules = list(
+            match_named_modules(model, self.resolved_targets, self.ignore)
+        )
+        
+        quantized_count = 0
+        
+        for name, module in tqdm(named_modules, desc="Quantizing weights to INT6"):
+            # Check if this module has 6-bit quantization
+            weights_args = getattr_chain(module, "quantization_scheme.weights", None)
+            if weights_args is None or weights_args.num_bits != 6:
+                continue
+            
+            # Check if quantization is frozen (calibration complete)
+            quantization_status = getattr(module, "quantization_status", None)
+            if quantization_status != QuantizationStatus.FROZEN:
+                continue
+            
+            # Get weight and scales
+            if not hasattr(module, "weight") or module.weight is None:
+                continue
+            
+            weight = module.weight.data
+            scales = self._get_scales(module)
+            zero_points = self._get_zero_points(module)
+            
+            if scales is None:
+                logger.warning(f"Skipping {name}: no scales found for quantization")
+                continue
+            
+            try:
+                # Quantize the weights
+                quantized_weight = self._quantize_weight_tensor(
+                    weight, scales, zero_points, weights_args
+                )
+                
+                # Replace the weight with quantized version
+                module.weight.data = quantized_weight
+                quantized_count += 1
+                
+                logger.debug(f"Quantized weights for {name}: {weight.shape}, dtype={weight.dtype} -> dtype={quantized_weight.dtype}")
+            except Exception as e:
+                logger.error(f"Failed to quantize weights for {name}: {e}", exc_info=True)
+                continue
+        
+        logger.info(f"FlexQ: Quantized {quantized_count} weight tensors to INT6")
+    
+    def _quantize_weight_tensor(
+        self,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        zero_points: torch.Tensor | None,
+        weights_args,
+    ) -> torch.Tensor:
+        """
+        Quantize a weight tensor to INT6.
+        
+        :param weight: FP16/FP32 weight tensor
+        :param scales: Quantization scales
+        :param zero_points: Quantization zero points (None for symmetric)
+        :param weights_args: QuantizationArgs for weights
+        :return: Quantized weight tensor (still as FP16/FP32 but with quantized values)
+        """
+        group_size = getattr(weights_args, "group_size", None) or self.w_group_size
+        symmetric = getattr(weights_args, "symmetric", True)
+        
+        original_shape = weight.shape
+        out_features, in_features = original_shape
+        
+        if symmetric:
+            # Symmetric quantization: range [-32, 31]
+            max_int = 2 ** (6 - 1) - 1  # 31
+            min_int = -(2 ** (6 - 1))   # -32
+            
+            if scales.dim() == 2:
+                # Group quantization
+                num_groups = scales.shape[-1]
+                assert in_features % num_groups == 0
+                group_size_actual = in_features // num_groups
+                
+                weight_reshaped = weight.view(out_features, num_groups, group_size_actual)
+                scales_expanded = scales.unsqueeze(-1)  # [out_features, num_groups, 1]
+                
+                # Quantize: round(weight / scale) and clamp
+                quantized = torch.clamp(
+                    torch.round(weight_reshaped / scales_expanded),
+                    min_int,
+                    max_int
+                )
+                
+                # Dequantize back to FP16/FP32 range for storage
+                quantized_weight = quantized * scales_expanded
+                quantized_weight = quantized_weight.view(original_shape)
+            else:
+                # Per-channel quantization
+                scales_expanded = scales.view(-1, 1) if scales.dim() == 1 else scales
+                quantized = torch.clamp(
+                    torch.round(weight / scales_expanded),
+                    min_int,
+                    max_int
+                )
+                quantized_weight = quantized * scales_expanded
+        else:
+            # Asymmetric quantization: range [0, 63]
+            max_int = 2 ** 6 - 1  # 63
+            min_int = 0
+            
+            if scales.dim() == 2:
+                num_groups = scales.shape[-1]
+                assert in_features % num_groups == 0
+                group_size_actual = in_features // num_groups
+                
+                weight_reshaped = weight.view(out_features, num_groups, group_size_actual)
+                scales_expanded = scales.unsqueeze(-1)
+                zero_points_expanded = zero_points.unsqueeze(-1) if zero_points is not None else None
+                
+                quantized = torch.clamp(
+                    torch.round(weight_reshaped / scales_expanded) + (zero_points_expanded if zero_points_expanded is not None else 0),
+                    min_int,
+                    max_int
+                )
+                
+                quantized_weight = (quantized - (zero_points_expanded if zero_points_expanded is not None else 0)) * scales_expanded
+                quantized_weight = quantized_weight.view(original_shape)
+            else:
+                scales_expanded = scales.view(-1, 1) if scales.dim() == 1 else scales
+                zero_points_expanded = zero_points.view(-1, 1) if zero_points is not None and zero_points.dim() == 1 else zero_points
+                
+                quantized = torch.clamp(
+                    torch.round(weight / scales_expanded) + (zero_points_expanded if zero_points_expanded is not None else 0),
+                    min_int,
+                    max_int
+                )
+                quantized_weight = (quantized - (zero_points_expanded if zero_points_expanded is not None else 0)) * scales_expanded
+        
+        return quantized_weight.to(weight.dtype)
+    
+    def _get_scales(self, module: Module) -> torch.Tensor | None:
+        """Get quantization scales from a module."""
+        # Try various methods to get scales
+        if hasattr(module, "weight_scale"):
+            scales = getattr(module, "weight_scale")
+            if torch.is_tensor(scales):
+                return scales.data if hasattr(scales, 'data') else scales
+        
+        for buffer_name, buffer in module.named_buffers():
+            if buffer_name == "weight_scale":
+                return buffer
+        
+        if hasattr(module, "_offload_weights_map"):
+            offload_map = getattr(module, "_offload_weights_map", {})
+            if "weight_scale" in offload_map:
+                scales = offload_map["weight_scale"]
+                return scales.data if hasattr(scales, 'data') else scales
+        
+        try:
+            state_dict = module.state_dict()
+            if "weight_scale" in state_dict:
+                return state_dict["weight_scale"]
+        except:
+            pass
+        
+        return None
+    
+    def _get_zero_points(self, module: Module) -> torch.Tensor | None:
+        """Get quantization zero points from a module."""
+        if hasattr(module, "weight_zero_point"):
+            zp = getattr(module, "weight_zero_point")
+            if torch.is_tensor(zp):
+                return zp.data if hasattr(zp, 'data') else zp
+        
+        for buffer_name, buffer in module.named_buffers():
+            if buffer_name == "weight_zero_point":
+                return buffer
+        
+        if hasattr(module, "_offload_weights_map"):
+            offload_map = getattr(module, "_offload_weights_map", {})
+            if "weight_zero_point" in offload_map:
+                zp = offload_map["weight_zero_point"]
+                return zp.data if hasattr(zp, 'data') else zp
+        
+        return None
+
     def _pack_weights(self, model: Module):
         """
         Pack 6-bit quantized weights into efficient format.
@@ -328,32 +522,109 @@ class FlexQModifier(Modifier, QuantizationMixin):
             match_named_modules(model, self.resolved_targets, self.ignore)
         )
         
+        packed_count = 0
+        skipped_no_scheme = 0
+        skipped_wrong_bits = 0
+        skipped_not_frozen = 0
+        skipped_no_weight = 0
+        skipped_no_scales = 0
+        
         for name, module in tqdm(named_modules, desc="Packing 6-bit weights"):
             # Check if this module has 6-bit quantization
             weights_args = getattr_chain(module, "quantization_scheme.weights", None)
             if weights_args is None:
+                skipped_no_scheme += 1
                 continue
             
             if weights_args.num_bits != 6:
+                skipped_wrong_bits += 1
+                if packed_count == 0 and skipped_wrong_bits == 1:
+                    logger.debug(f"Example skip: {name} has {weights_args.num_bits} bits, expected 6")
                 continue
             
             # Check if quantization is frozen (calibration complete)
             quantization_status = getattr(module, "quantization_status", None)
             if quantization_status != QuantizationStatus.FROZEN:
-                logger.debug(f"Skipping {name}: quantization_status={quantization_status}, expected FROZEN")
+                skipped_not_frozen += 1
+                if skipped_not_frozen == 1:
+                    logger.debug(f"Example skip: {name} quantization_status={quantization_status}, expected FROZEN")
                 continue
             
             # Get quantized weight, scales, and zero points
             if not hasattr(module, "weight") or module.weight is None:
-                logger.debug(f"Skipping {name}: no weight attribute")
+                skipped_no_weight += 1
                 continue
             
             weight = module.weight.data
-            scales = getattr(module, "weight_scale", None)
-            zero_points = getattr(module, "weight_zero_point", None)
+            
+            # Try to get scales - compressed-tensors stores them via update_offload_parameter
+            # They might be stored as buffers, attributes, or in a special offload structure
+            scales = None
+            zero_points = None
+            
+            # Method 1: Direct attribute access
+            if hasattr(module, "weight_scale"):
+                scales = getattr(module, "weight_scale")
+                if torch.is_tensor(scales):
+                    scales = scales.data if hasattr(scales, 'data') else scales
+            
+            # Method 2: Check buffers
+            if scales is None:
+                for buffer_name, buffer in module.named_buffers():
+                    if buffer_name == "weight_scale":
+                        scales = buffer
+                        break
+            
+            # Method 3: Check if stored in _offload_weights_map (internal compressed-tensors structure)
+            if scales is None and hasattr(module, "_offload_weights_map"):
+                offload_map = getattr(module, "_offload_weights_map", {})
+                if "weight_scale" in offload_map:
+                    scales = offload_map["weight_scale"]
+                    if hasattr(scales, 'data'):
+                        scales = scales.data
+            
+            # Method 4: Try accessing via state_dict (scales might be registered there)
+            if scales is None:
+                try:
+                    state_dict = module.state_dict()
+                    if "weight_scale" in state_dict:
+                        scales = state_dict["weight_scale"]
+                except:
+                    pass
+            
+            # Similar for zero_points
+            if hasattr(module, "weight_zero_point"):
+                zero_points = getattr(module, "weight_zero_point")
+                if torch.is_tensor(zero_points):
+                    zero_points = zero_points.data if hasattr(zero_points, 'data') else zero_points
+            
+            if zero_points is None:
+                for buffer_name, buffer in module.named_buffers():
+                    if buffer_name == "weight_zero_point":
+                        zero_points = buffer
+                        break
+            
+            if zero_points is None and hasattr(module, "_offload_weights_map"):
+                offload_map = getattr(module, "_offload_weights_map", {})
+                if "weight_zero_point" in offload_map:
+                    zero_points = offload_map["weight_zero_point"]
+                    if hasattr(zero_points, 'data'):
+                        zero_points = zero_points.data
             
             if scales is None:
-                logger.warning(f"Skipping {name}: no weight_scale found")
+                skipped_no_scales += 1
+                if skipped_no_scales <= 3:  # Show first 3 examples
+                    # Debug: show what's actually available
+                    all_attrs = [attr for attr in dir(module) if not attr.startswith('__')]
+                    scale_attrs = [attr for attr in all_attrs if 'scale' in attr.lower()]
+                    buffer_names = [name for name, _ in module.named_buffers()]
+                    logger.warning(
+                        f"Example skip: {name} - no weight_scale found.\n"
+                        f"  Scale-related attributes: {scale_attrs}\n"
+                        f"  Buffers: {buffer_names}\n"
+                        f"  Has _offload_weights_map: {hasattr(module, '_offload_weights_map')}\n"
+                        f"  Quantization scheme weights num_bits: {weights_args.num_bits if weights_args else 'N/A'}"
+                    )
                 continue
             
             # Pack the weights
@@ -382,11 +653,16 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 module._flexq_has_packed_weights = True
                 
                 logger.debug(f"Packed weights for {name}: {weight.shape} -> {packed_weight.shape}")
+                packed_count += 1
             except Exception as e:
-                logger.error(f"Failed to pack weights for {name}: {e}")
+                logger.error(f"Failed to pack weights for {name}: {e}", exc_info=True)
                 continue
         
-        logger.info(f"FlexQ: Packed {len(self._packed_weights)} weight tensors")
+        logger.info(
+            f"FlexQ: Packed {len(self._packed_weights)} weight tensors. "
+            f"Skipped: {skipped_no_scheme} no scheme, {skipped_wrong_bits} wrong bits, "
+            f"{skipped_not_frozen} not frozen, {skipped_no_weight} no weight, {skipped_no_scales} no scales"
+        )
         
         # Store packed weights on the model object for access during save
         # This avoids device movement issues since we're not storing tensors as module attributes
