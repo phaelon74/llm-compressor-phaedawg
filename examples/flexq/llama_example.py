@@ -195,29 +195,45 @@ for name, module in quantized_modules[:3]:  # Check first 3 modules
 
 print(f"\nFound {packed_count} modules with packed weights out of {len(quantized_modules)} total")
 
-# Hook into state_dict to use packed weights when saving
-# compressed-tensors might access weights directly, so we need to temporarily
-# replace the weight tensors with packed versions
-original_weights = {}
-packed_modules = []
+# Check for packed weights
+packed_modules_count = sum(
+    1 for _, module in model.named_modules()
+    if hasattr(module, "_flexq_has_packed_weights") and module._flexq_has_packed_weights
+)
+print(f"Found {packed_modules_count} modules with packed weights metadata")
 
-for name, module in model.named_modules():
-    if hasattr(module, "_flexq_packed_weight") and hasattr(module, "weight"):
-        original_weights[name] = module.weight.data.clone()
-        # Temporarily replace weight with packed version
-        module.weight.data = module._flexq_packed_weight
-        packed_modules.append((name, module))
-        print(f"Replaced weight for {name} with packed version: {original_weights[name].shape} -> {module._flexq_packed_weight.shape}")
-
-try:
-    # Save with packed weights
+# Access packed weights from model if available
+if hasattr(model, "_flexq_packed_weights") and model._flexq_packed_weights:
+    print(f"Found {len(model._flexq_packed_weights)} packed weight tensors on model")
+    
+    # Hook into state_dict to use packed weights when saving
+    original_state_dict = model.state_dict
+    
+    def state_dict_with_packed_weights(*args, **kwargs):
+        """Custom state_dict that uses packed weights for FlexQ modules."""
+        state = original_state_dict(*args, **kwargs)
+        
+        # Replace weights with packed versions where available
+        for name, (packed_weight, _) in model._flexq_packed_weights.items():
+            param_name = f"{name}.weight"
+            if param_name in state:
+                state[param_name] = packed_weight
+                print(f"Using packed weight for {param_name}: {state[param_name].shape}")
+        
+        return state
+    
+    # Temporarily replace state_dict
+    model.state_dict = state_dict_with_packed_weights
+    
+    try:
+        model.save_pretrained(SAVE_DIR, save_compressed=True)
+    finally:
+        # Restore original state_dict
+        model.state_dict = original_state_dict
+else:
+    # No packed weights found, save normally
+    print("No packed weights found, saving model normally")
     model.save_pretrained(SAVE_DIR, save_compressed=True)
-finally:
-    # Restore original weights for inference
-    for name, module in packed_modules:
-        if name in original_weights:
-            module.weight.data = original_weights[name]
-            print(f"Restored original weight for {name}")
 
 tokenizer.save_pretrained(SAVE_DIR)
 
