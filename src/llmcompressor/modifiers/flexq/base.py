@@ -196,6 +196,13 @@ class FlexQModifier(Modifier, QuantizationMixin):
             if not self.started_:
                 self.on_start(state, event, **kwargs)
 
+        elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
+            # Quantize weights after each sequential segment is calibrated
+            # This is crucial - quantize immediately after calibration while scales are available
+            if self._num_bits == 6:
+                logger.debug("FlexQ: Quantizing weights for current sequential segment...")
+                self._quantize_weights_for_segment(state.model, kwargs.get("segment", None))
+
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
             # Perform sensitivity analysis if enabled
             if self.enable_selective_activation:
@@ -215,15 +222,9 @@ class FlexQModifier(Modifier, QuantizationMixin):
         """
         self.ended_ = True
 
-        # Quantize and pack 6-bit weights BEFORE ending calibration
-        # (end_calibration removes observers, so we need scales before that)
-        # The scales are computed during forward passes in calibration mode
+        # Pack 6-bit weights for efficient storage
+        # Quantization already happened during sequential pipeline via SEQUENTIAL_EPOCH_END
         if self._num_bits == 6:
-            # Quantize weights to INT6 using the scales computed during calibration
-            logger.info("FlexQ: Quantizing weights to INT6...")
-            self._quantize_weights(state.model)
-            
-            # Pack quantized weights for efficient storage
             logger.info("FlexQ: Packing 6-bit weights for efficient storage...")
             self._pack_weights(state.model)
 
@@ -316,6 +317,79 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 f"{list(self._sensitive_layers)[:5]}..."  # Show first 5
             )
 
+    def _quantize_weights_for_segment(self, model: Module, segment: list[str] | None = None):
+        """
+        Quantize weights for a specific segment (used during sequential pipeline).
+        
+        :param model: The model
+        :param segment: List of module names in the current segment (if None, quantize all)
+        """
+        from compressed_tensors.quantization import QuantizationStatus
+        from compressed_tensors.utils import getattr_chain
+        
+        # Get modules to quantize - either from segment or all targets
+        if segment is not None:
+            # Quantize only modules in this segment
+            named_modules = [
+                (name, module) for name, module in match_named_modules(model, segment, self.ignore)
+            ]
+        else:
+            # Quantize all target modules
+            named_modules = list(
+                match_named_modules(model, self.resolved_targets, self.ignore)
+            )
+        
+        quantized_count = 0
+        
+        for name, module in named_modules:
+            # Check if this module has 6-bit quantization
+            weights_args = getattr_chain(module, "quantization_scheme.weights", None)
+            if weights_args is None or weights_args.num_bits != 6:
+                continue
+            
+            # Check if quantization is in calibration mode
+            quantization_status = getattr(module, "quantization_status", None)
+            if quantization_status != QuantizationStatus.CALIBRATION:
+                continue
+            
+            # Get weight and scales
+            if not hasattr(module, "weight") or module.weight is None:
+                continue
+            
+            try:
+                weight = module.weight.data
+                if weight.device.type == "meta":
+                    continue
+            except Exception:
+                continue
+            
+            scales = self._get_scales(module)
+            zero_points = self._get_zero_points(module)
+            
+            if scales is None:
+                continue
+            
+            try:
+                # Quantize the weights
+                quantized_weight = self._quantize_weight_tensor(
+                    weight, scales, zero_points, weights_args
+                )
+                
+                # Replace the weight - ensure same dtype and device
+                # Use copy_ to preserve tensor type (Parameter vs Tensor)
+                with torch.no_grad():
+                    quantized_weight = quantized_weight.to(dtype=weight.dtype, device=weight.device)
+                    # Use copy_ to preserve the Parameter type and avoid "incompatible tensor type" error
+                    module.weight.data.copy_(quantized_weight)
+                
+                quantized_count += 1
+            except Exception as e:
+                logger.debug(f"Failed to quantize weights for {name}: {e}")
+                continue
+        
+        if quantized_count > 0:
+            logger.debug(f"FlexQ: Quantized {quantized_count} weight tensors in segment")
+    
     def _quantize_weights(self, model: Module):
         """
         Quantize weights to INT6 using the computed scales.
