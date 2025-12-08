@@ -659,12 +659,13 @@ class FlexQModifier(Modifier, QuantizationMixin):
                     logger.debug(f"Example skip: {name} has {weights_args.num_bits} bits, expected 6")
                 continue
             
-            # Check if quantization is frozen (calibration complete)
+            # Check if quantization is complete (FROZEN) or was in calibration (weights already quantized)
+            # We quantize during CALIBRATION, so by packing time status might be FROZEN or still CALIBRATION
             quantization_status = getattr(module, "quantization_status", None)
-            if quantization_status != QuantizationStatus.FROZEN:
+            if quantization_status not in (QuantizationStatus.FROZEN, QuantizationStatus.CALIBRATION):
                 skipped_not_frozen += 1
                 if skipped_not_frozen == 1:
-                    logger.debug(f"Example skip: {name} quantization_status={quantization_status}, expected FROZEN")
+                    logger.debug(f"Example skip: {name} quantization_status={quantization_status}, expected FROZEN or CALIBRATION")
                 continue
             
             # Get quantized weight, scales, and zero points
@@ -745,6 +746,8 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 continue
             
             # Pack the weights
+            # Note: weights should already be quantized from _quantize_weights_for_segment
+            # But we need to re-quantize to INT6 integers for packing (weights are currently quantized FP16)
             try:
                 # Get group_size from quantization scheme
                 weights_args = getattr_chain(module, "quantization_scheme.weights", None)
@@ -757,6 +760,7 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 scales_cpu = scales.cpu() if scales.device.type != "cpu" else scales
                 zero_points_cpu = zero_points.cpu() if zero_points is not None and zero_points.device.type != "cpu" else zero_points
                 
+                # Pack the quantized weights (they're already quantized, just need to pack to INT6 format)
                 packed_weight, metadata = pack_int6_weights(weight_cpu, scales_cpu, zero_points_cpu, group_size)
                 # Store packed weight in modifier's dict (not as module attribute to avoid device movement issues)
                 self._packed_weights[name] = (packed_weight, metadata)
