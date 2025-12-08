@@ -331,16 +331,21 @@ class FlexQModifier(Modifier, QuantizationMixin):
         for name, module in tqdm(named_modules, desc="Packing 6-bit weights"):
             # Check if this module has 6-bit quantization
             weights_args = getattr_chain(module, "quantization_scheme.weights", None)
-            if weights_args is None or weights_args.num_bits != 6:
+            if weights_args is None:
+                continue
+            
+            if weights_args.num_bits != 6:
                 continue
             
             # Check if quantization is frozen (calibration complete)
-            if getattr(module, "quantization_status", None) != QuantizationStatus.FROZEN:
-                logger.warning(f"Skipping {name}: quantization not frozen")
+            quantization_status = getattr(module, "quantization_status", None)
+            if quantization_status != QuantizationStatus.FROZEN:
+                logger.debug(f"Skipping {name}: quantization_status={quantization_status}, expected FROZEN")
                 continue
             
             # Get quantized weight, scales, and zero points
             if not hasattr(module, "weight") or module.weight is None:
+                logger.debug(f"Skipping {name}: no weight attribute")
                 continue
             
             weight = module.weight.data
@@ -351,41 +356,41 @@ class FlexQModifier(Modifier, QuantizationMixin):
                 logger.warning(f"Skipping {name}: no weight_scale found")
                 continue
             
-                # Pack the weights
-                try:
-                    # Get group_size from quantization scheme
-                    weights_args = getattr_chain(module, "quantization_scheme.weights", None)
-                    group_size = getattr(weights_args, "group_size", None) if weights_args else None
-                    if group_size is None or group_size <= 0:
-                        group_size = self.w_group_size
-                    
-                    # Ensure weight is on CPU for packing (to avoid device issues)
-                    weight_cpu = weight.cpu() if weight.device.type != "cpu" else weight
-                    scales_cpu = scales.cpu() if scales.device.type != "cpu" else scales
-                    zero_points_cpu = zero_points.cpu() if zero_points is not None and zero_points.device.type != "cpu" else zero_points
-                    
-                    packed_weight, metadata = pack_int6_weights(weight_cpu, scales_cpu, zero_points_cpu, group_size)
-                    # Store packed weight in modifier's dict (not as module attribute to avoid device movement issues)
-                    self._packed_weights[name] = (packed_weight, metadata)
-                    
-                    # Store only lightweight metadata as module attributes (not tensors)
-                    # This allows us to identify which modules have packed weights without interfering with device movement
-                    module._flexq_packing_metadata = {
-                        "original_shape": tuple(weight.shape),
-                        "symmetric": zero_points is None,
-                    }
-                    module._flexq_has_packed_weights = True
-                    
-                    logger.debug(f"Packed weights for {name}: {weight.shape} -> {packed_weight.shape}")
-                except Exception as e:
-                    logger.error(f"Failed to pack weights for {name}: {e}")
-                    continue
+            # Pack the weights
+            try:
+                # Get group_size from quantization scheme
+                weights_args = getattr_chain(module, "quantization_scheme.weights", None)
+                group_size = getattr(weights_args, "group_size", None) if weights_args else None
+                if group_size is None or group_size <= 0:
+                    group_size = self.w_group_size
+                
+                # Ensure weight is on CPU for packing (to avoid device issues)
+                weight_cpu = weight.cpu() if weight.device.type != "cpu" else weight
+                scales_cpu = scales.cpu() if scales.device.type != "cpu" else scales
+                zero_points_cpu = zero_points.cpu() if zero_points is not None and zero_points.device.type != "cpu" else zero_points
+                
+                packed_weight, metadata = pack_int6_weights(weight_cpu, scales_cpu, zero_points_cpu, group_size)
+                # Store packed weight in modifier's dict (not as module attribute to avoid device movement issues)
+                self._packed_weights[name] = (packed_weight, metadata)
+                
+                # Store only lightweight metadata as module attributes (not tensors)
+                # This allows us to identify which modules have packed weights without interfering with device movement
+                module._flexq_packing_metadata = {
+                    "original_shape": tuple(weight.shape),
+                    "symmetric": zero_points is None,
+                }
+                module._flexq_has_packed_weights = True
+                
+                logger.debug(f"Packed weights for {name}: {weight.shape} -> {packed_weight.shape}")
+            except Exception as e:
+                logger.error(f"Failed to pack weights for {name}: {e}")
+                continue
         
         logger.info(f"FlexQ: Packed {len(self._packed_weights)} weight tensors")
         
         # Store packed weights on the model object for access during save
         # This avoids device movement issues since we're not storing tensors as module attributes
-        if not hasattr(state.model, "_flexq_packed_weights"):
-            state.model._flexq_packed_weights = {}
-        state.model._flexq_packed_weights.update(self._packed_weights)
+        if not hasattr(model, "_flexq_packed_weights"):
+            model._flexq_packed_weights = {}
+        model._flexq_packed_weights.update(self._packed_weights)
 
