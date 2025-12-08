@@ -66,9 +66,23 @@ Please refer to [compression_schemes.md](./docs/guides/compression_schemes.md) f
 
 ## Installation
 
+### Install from PyPI (Stable Release)
+
 ```bash
 pip install llmcompressor
 ```
+
+### Install from Source (Latest Features, including FlexQ)
+
+To use the latest features like FlexQ 6-bit quantization, install from source:
+
+```bash
+git clone https://github.com/vllm-project/llm-compressor.git
+cd llm-compressor
+pip install -e ".[dev]"
+```
+
+See [INSTALL_FROM_SOURCE.md](INSTALL_FROM_SOURCE.md) for detailed installation instructions.
 
 ## Get Started
 
