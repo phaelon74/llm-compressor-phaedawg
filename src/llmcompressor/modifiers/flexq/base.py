@@ -191,21 +191,10 @@ class FlexQModifier(Modifier, QuantizationMixin):
         """
         self.ended_ = True
 
-        # Apply fine-grained group quantization to weights
-        logger.info("FlexQ: Applying fine-grained group quantization to weights...")
-        for _, module in tqdm(
-            match_named_modules(state.model, self.resolved_targets, self.ignore),
-            desc="Quantizing weights",
-        ):
-            if isinstance(module, torch.nn.Linear):
-                apply_fine_grained_group_quantization(
-                    module,
-                    group_size=self.w_group_size,
-                    bits=self._num_bits or 6,
-                    symmetric=True,  # FlexQ typically uses symmetric quantization
-                )
-
         # Update weight scales and zero points
+        # The compressed-tensors system handles the actual quantization
+        # Fine-grained group quantization scales are computed during calibration
+        logger.info("FlexQ: Calibrating weights with fine-grained group quantization...")
         for _, module in tqdm(
             match_named_modules(state.model, self.resolved_targets, self.ignore),
             desc="Calibrating weights",

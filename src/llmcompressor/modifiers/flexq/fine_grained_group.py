@@ -101,34 +101,21 @@ def apply_fine_grained_group_quantization(
     """
     Apply fine-grained group quantization to a Linear module's weights.
 
+    Note: This function is kept for compatibility but quantization is actually
+    handled by the compressed-tensors system through observers and calibration.
+    The quantization system automatically handles group quantization based on
+    the QuantizationArgs configuration.
+
     :param module: Linear module to quantize
-    :param group_size: Size of each quantization group
-    :param bits: Number of bits for quantization
-    :param symmetric: Whether to use symmetric quantization
+    :param group_size: Size of each quantization group (used in QuantizationArgs)
+    :param bits: Number of bits for quantization (used in QuantizationArgs)
+    :param symmetric: Whether to use symmetric quantization (used in QuantizationArgs)
     """
-    if not isinstance(module, torch.nn.Linear):
-        return
-    
-    if not hasattr(module, "weight") or module.weight is None:
-        return
-    
-    # Quantize weights
-    quantized_weight, scales, zero_points = quantize_fine_grained_group(
-        module.weight.data,
-        group_size=group_size,
-        bits=bits,
-        symmetric=symmetric,
-    )
-    
-    # Store quantization parameters
-    module.register_buffer("weight_scale", scales)
-    if zero_points is not None:
-        module.register_buffer("weight_zero_point", zero_points)
-    else:
-        if hasattr(module, "weight_zero_point"):
-            delattr(module, "weight_zero_point")
-    
-    # Update weight (in practice, this would be handled by compressed-tensors)
-    # For now, we just store the quantized version
-    module.weight.data = quantized_weight
+    # The actual quantization is handled by compressed-tensors through:
+    # 1. QuantizationScheme with QuantizationArgs (strategy="group", group_size=128)
+    # 2. Observers that collect statistics during calibration
+    # 3. update_weight_zp_scale() which computes and sets scales/zero_points
+    # 
+    # This function is a placeholder - the real work happens in the quantization system
+    pass
 

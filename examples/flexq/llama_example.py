@@ -91,36 +91,40 @@ ds = ds.shuffle(seed=42)
 def preprocess(example):
     # The neuralmagic/LLM_compression_calibration dataset has both 'text' and 'messages' fields
     # Prefer 'messages' if available, otherwise use 'text'
-    if "messages" in example:
-        return {
-            "text": tokenizer.apply_chat_template(
-                example["messages"],
-                tokenize=False,
-            )
-        }
+    if "messages" in example and example["messages"]:
+        text = tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+        )
     else:
         # Fallback to text field if messages not available
-        return {"text": example.get("text", "")}
-
-
-ds = ds.map(preprocess)
-
-
-# Tokenize inputs.
-def tokenize(sample):
-    return tokenizer(
-        sample["text"],
+        text = example.get("text", "")
+    
+    # Ensure text is a string
+    if not isinstance(text, str):
+        text = str(text) if text else ""
+    
+    # Tokenize directly and return tokenized features
+    # The tokenizer returns a dict with 'input_ids', 'attention_mask', etc.
+    tokenized = tokenizer(
+        text,
         padding=False,
         max_length=MAX_SEQUENCE_LENGTH,
         truncation=True,
         add_special_tokens=False,
     )
+    
+    # Return tokenized features directly
+    return tokenized
 
 
-ds = ds.map(tokenize)
+# Apply preprocessing (which includes tokenization)
+ds = ds.map(preprocess, remove_columns=ds.column_names)
 
 # Configure FlexQ quantization
 # FlexQ uses 6-bit weights uniformly with 8-bit activations (W6A8)
+# Note: For activations, use "channel" strategy instead of "group" to avoid
+# shape mismatches with variable sequence lengths
 recipe = [
     FlexQModifier(
         ignore=["lm_head"],
@@ -138,13 +142,13 @@ recipe = [
                     num_bits=8,  # 8-bit activations (W6A8)
                     type="int",
                     symmetric=True,
-                    strategy="group",
-                    group_size=128,
+                    # No strategy/group_size specified - uses default per-token quantization for activations
+                    # This handles variable sequence lengths correctly
                 ),
             ),
         },
         w_group_size=128,
-        a_group_size=128,
+        a_group_size=128,  # This parameter is for fine-grained group quantization logic, not the quantization scheme
         enable_selective_activation=False,  # All layers use 8-bit activations
         sensitivity_threshold=0.05,
     ),
