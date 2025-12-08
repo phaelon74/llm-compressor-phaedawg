@@ -215,26 +215,21 @@ class FlexQModifier(Modifier, QuantizationMixin):
         """
         self.ended_ = True
 
-        # End calibration - this freezes quantization and removes observers
-        QuantizationMixin.end_calibration(self, state.model)
-
-        # Quantize and pack 6-bit weights
+        # Quantize and pack 6-bit weights BEFORE ending calibration
+        # (end_calibration removes observers, so we need scales before that)
+        # The scales are computed during forward passes in calibration mode
         if self._num_bits == 6:
-            # First, ensure all weights are calibrated (scales computed)
-            logger.info("FlexQ: Finalizing weight calibration...")
-            named_modules = list(
-                match_named_modules(state.model, self.resolved_targets, self.ignore)
-            )
-            for _, module in tqdm(named_modules, desc="Finalizing calibration"):
-                update_weight_zp_scale(module)
-            
-            # Now quantize weights to INT6 (actually replace FP16 with quantized values)
+            # Quantize weights to INT6 using the scales computed during calibration
             logger.info("FlexQ: Quantizing weights to INT6...")
             self._quantize_weights(state.model)
             
             # Pack quantized weights for efficient storage
             logger.info("FlexQ: Packing 6-bit weights for efficient storage...")
             self._pack_weights(state.model)
+
+        # End calibration - this freezes quantization and removes observers
+        # Do this AFTER quantization so scales are still available
+        QuantizationMixin.end_calibration(self, state.model)
 
         logger.info("FlexQ: Calibration complete")
 
@@ -345,9 +340,11 @@ class FlexQModifier(Modifier, QuantizationMixin):
             if weights_args is None or weights_args.num_bits != 6:
                 continue
             
-            # Check if quantization is frozen (calibration complete)
+            # Check if quantization is in calibration mode
+            # We quantize BEFORE end_calibration is called, so status should be CALIBRATION
             quantization_status = getattr(module, "quantization_status", None)
-            if quantization_status != QuantizationStatus.FROZEN:
+            if quantization_status != QuantizationStatus.CALIBRATION:
+                logger.debug(f"Skipping {name}: quantization_status={quantization_status}, expected CALIBRATION")
                 continue
             
             # Get weight and scales - ensure weight is materialized
