@@ -127,9 +127,28 @@ def preprocess(example):
 ds = ds.map(preprocess, remove_columns=ds.column_names)
 
 # Configure FlexQ quantization
-# FlexQ uses 6-bit weights uniformly with 8-bit activations (W6A8)
-# Note: For activations, use "channel" strategy instead of "group" to avoid
-# shape mismatches with variable sequence lengths
+# FlexQ supports both W6A8 (6-bit weights, 8-bit activations) and W6A16 (6-bit weights, 16-bit activations)
+# 
+# W6A8: Better memory savings, requires FlexQ's custom CUDA kernels for optimal performance
+# W6A16: Better accuracy, simpler (no activation quantization), works with standard kernels
+#
+# Note: FlexQ's custom kernels are optimized for W6A6/W6A8, but W6A16 works fine with standard inference
+
+ACTIVATION_BITS = 8  # Set to 8 for W6A8, or None for W6A16 (keep activations at FP16)
+
+if ACTIVATION_BITS == 8:
+    # W6A8: Quantize activations to 8-bit
+    input_activations = QuantizationArgs(
+        num_bits=8,
+        type="int",
+        symmetric=True,
+        # No strategy/group_size specified - uses default per-token quantization for activations
+        # This handles variable sequence lengths correctly
+    )
+else:
+    # W6A16: Keep activations at FP16 (no quantization)
+    input_activations = None
+
 recipe = [
     FlexQModifier(
         ignore=["lm_head"],
@@ -143,18 +162,12 @@ recipe = [
                     strategy="group",
                     group_size=128,
                 ),
-                input_activations=QuantizationArgs(
-                    num_bits=8,  # 8-bit activations (W6A8)
-                    type="int",
-                    symmetric=True,
-                    # No strategy/group_size specified - uses default per-token quantization for activations
-                    # This handles variable sequence lengths correctly
-                ),
+                input_activations=input_activations,
             ),
         },
         w_group_size=128,
         a_group_size=128,  # This parameter is for fine-grained group quantization logic, not the quantization scheme
-        enable_selective_activation=False,  # All layers use 8-bit activations
+        enable_selective_activation=False,  # Not used for W6A16
         sensitivity_threshold=0.05,
     ),
 ]
