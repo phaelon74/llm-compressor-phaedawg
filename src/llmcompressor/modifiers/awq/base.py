@@ -473,6 +473,14 @@ class AWQModifier(Modifier, QuantizationMixin):
                 # All layer weights are concatted together
                 weight = torch.cat([bl.weight for bl in balance_layers], dim=0)
                 org_shape = weight.shape
+                
+                # FP8 tensors don't support in-place operations like abs_()
+                # Convert to float32 for smoothing computations, then convert back if needed
+                original_dtype = weight.dtype
+                if weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    # Convert FP8 to float32 for operations that aren't supported
+                    weight = weight.to(torch.float32)
+                
                 # The weights are reshaped to be organised by quantization group
                 if self._group_size > 0:
                     weight = weight.view(-1, self._group_size)
