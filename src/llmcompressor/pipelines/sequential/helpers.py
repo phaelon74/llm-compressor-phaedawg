@@ -76,21 +76,12 @@ class Subgraph:
             # In the generated code, "self" refers to the model (the root), so self.config should work
             # The issue is that get_attr("config") serializes incorrectly as just "config"
             import re
-            # Replace bare "config" references (not already self.config, not in assignments) with "self.config"
-            # Pattern: config that's not preceded by "self." or word char, and is followed by comma, paren, bracket, or whitespace
-            # But NOT when it's part of an assignment like "config ="
-            lines = self._code.src.split('\n')
-            fixed_lines = []
-            for line in lines:
-                # Skip assignment lines (they should be handled correctly by torch.fx)
-                if re.search(r'\bconfig\s*=', line):
-                    fixed_lines.append(line)
-                else:
-                    # Replace bare config references with self.config
-                    # Match: config not preceded by self. or word char, followed by comma/paren/bracket
-                    fixed_line = re.sub(r'(?<!self\.)(?<!\w)\bconfig\b(?=\s*[,\)\]])', 'self.config', line)
-                    fixed_lines.append(fixed_line)
-            self._code.src = '\n'.join(fixed_lines)
+            # Replace ALL bare "config" references with "self.config"
+            # Be very aggressive - replace config anywhere it appears as a bare variable
+            # Pattern: config that's not already self.config and not part of other words
+            # Replace ALL occurrences of bare "config" (not preceded by "self." or word char)
+            # This handles: function args, variable references, etc.
+            self._code.src = re.sub(r'(?<!self\.)(?<!\w)\bconfig\b', 'self.config', self._code.src)
             
             exec(self._code.src, self._code.globals)
 
