@@ -107,7 +107,7 @@ def trace_subgraphs(
     offloaded = set(m for m in model.modules() if has_offloaded_params(m))
 
     # initialize arguments
-    tracer = SequentialTracer(ancestors, offloaded)
+    tracer = SequentialTracer(ancestors, offloaded, model)
     concrete_args = populate_concrete_args(model, sample_input)
 
     with contextlib.ExitStack() as stack:
@@ -175,11 +175,13 @@ class SequentialTracer(HFTracer):
 
     :param ancestors: modules which are ancestors of sequential targets
     :param offloaded: modules which have offloaded params and should not be traced
+    :param model: the model being traced, used to avoid serializing config objects
     """
 
-    def __init__(self, ancestors: Set[Module], offloaded: Set[Module]):
+    def __init__(self, ancestors: Set[Module], offloaded: Set[Module], model: Optional[PreTrainedModel] = None):
         self.ancestors = ancestors
         self.offloaded = offloaded
+        self.model = model
 
         # skip any mask creation functions not already caught by the autowrapper
         super().__init__(autowrap_functions=_get_autowrap_functions())
@@ -195,10 +197,39 @@ class SequentialTracer(HFTracer):
             )
 
     def create_arg(self, a: Any) -> Argument:
-        # special extension allows models which depend on config values to be traced
+        # Avoid serializing PretrainedConfig objects to prevent SyntaxError from
+        # very long single-line parameter lists, complex nested structures, enums,
+        # and path strings. Instead, reference the config via get_attr if it's the
+        # model's config, otherwise fall back to a simplified serialization.
         if isinstance(a, PretrainedConfig):
+            # If this is the model's config, reference it via get_attr instead of serializing
+            # This avoids the SyntaxError from very long single-line parameter lists
+            if self.model is not None and a is self.model.config:
+                # Create a proxy for the config attribute to avoid full serialization
+                return self.create_proxy("get_attr", "config", (), {})
+            
+            # For other config objects (shouldn't happen in practice), use a simplified
+            # approach: only serialize essential attributes to avoid syntax errors
+            # This handles cases where config might be passed as an argument
+            try:
+                # Try to serialize only essential config attributes
+                essential_attrs = {}
+                for key in ['vocab_size', 'hidden_size', 'num_attention_heads', 
+                           'num_hidden_layers', 'intermediate_size', 'max_position_embeddings']:
+                    if hasattr(a, key):
+                        essential_attrs[key] = getattr(a, key)
+                
+                # If we have essential attrs, create a minimal config
+                if essential_attrs:
+                    kwargs = {k: self.create_arg(v) for k, v in essential_attrs.items()}
+                    return self.create_proxy("call_function", a.__class__, (), kwargs)
+            except Exception:
+                pass
+            
+            # Fallback: serialize the full config (may still fail, but preserves original behavior)
+            # Note: This may still cause SyntaxError for very complex configs, but it's a fallback
             kwargs = {k: self.create_arg(v) for k, v in a.to_dict().items()}
-            return self.create_node("call_function", a.__class__, (), kwargs)
+            return self.create_proxy("call_function", a.__class__, (), kwargs)
 
         else:
             return super().create_arg(a)
