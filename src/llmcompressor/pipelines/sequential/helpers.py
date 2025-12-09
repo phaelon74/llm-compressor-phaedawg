@@ -199,14 +199,22 @@ class SequentialTracer(HFTracer):
     def create_arg(self, a: Any) -> Argument:
         # Avoid serializing PretrainedConfig objects to prevent SyntaxError from
         # very long single-line parameter lists, complex nested structures, enums,
-        # and path strings. Instead, reference the config via get_attr if it's the
-        # model's config, otherwise fall back to a simplified serialization.
+        # and path strings. Instead, store the config on the root module and reference
+        # it via get_attr, or return it as a concrete value to avoid serialization.
         if isinstance(a, PretrainedConfig):
-            # If this is the model's config, reference it via get_attr instead of serializing
+            # If this is the model's config, ensure it's stored on root and use get_attr
             # This avoids the SyntaxError from very long single-line parameter lists
             if self.model is not None and a is self.model.config:
-                # Create a proxy for the config attribute to avoid full serialization
-                return self.create_proxy("get_attr", "config", (), {})
+                # Ensure root has config attribute for get_attr to reference
+                if hasattr(self, 'root') and self.root is not None:
+                    if not hasattr(self.root, 'config'):
+                        self.root.config = a
+                    # Create get_attr node that will serialize as self.config
+                    return self.create_proxy("get_attr", "config", (), {})
+                else:
+                    # If root not available yet, return config as concrete value
+                    # This avoids serialization but config won't be traced
+                    return a
             
             # For other config objects (shouldn't happen in practice), use a simplified
             # approach: only serialize essential attributes to avoid syntax errors
