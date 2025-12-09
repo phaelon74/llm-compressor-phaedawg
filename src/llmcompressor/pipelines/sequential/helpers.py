@@ -67,6 +67,10 @@ class Subgraph:
         """
         if self._code is None:
             self._code = self.graph.python_code("self")
+            # Ensure Proxy is available in globals if needed (for get_attr nodes)
+            if "Proxy" not in self._code.globals:
+                from torch.fx.proxy import Proxy
+                self._code.globals["Proxy"] = Proxy
             exec(self._code.src, self._code.globals)
 
         forward_fn = self._code.globals.get("forward")
@@ -109,6 +113,11 @@ def trace_subgraphs(
     # initialize arguments
     tracer = SequentialTracer(ancestors, offloaded, model)
     concrete_args = populate_concrete_args(model, sample_input)
+    
+    # Ensure config is stored on model for get_attr to work during tracing
+    # This is needed to avoid serialization issues with complex config objects
+    if not hasattr(model, 'config'):
+        model.config = model.config  # Ensure it exists (it should already)
 
     with contextlib.ExitStack() as stack:
         # calibration context
@@ -199,22 +208,15 @@ class SequentialTracer(HFTracer):
     def create_arg(self, a: Any) -> Argument:
         # Avoid serializing PretrainedConfig objects to prevent SyntaxError from
         # very long single-line parameter lists, complex nested structures, enums,
-        # and path strings. Instead, store the config on the root module and reference
-        # it via get_attr, or return it as a concrete value to avoid serialization.
+        # and path strings. Return the config as a concrete value to avoid serialization.
         if isinstance(a, PretrainedConfig):
-            # If this is the model's config, ensure it's stored on root and use get_attr
-            # This avoids the SyntaxError from very long single-line parameter lists
+            # If this is the model's config, return it as a concrete value
+            # This avoids the SyntaxError from serialization entirely
+            # The config is already stored on the model and will be accessible at runtime
             if self.model is not None and a is self.model.config:
-                # Ensure root has config attribute for get_attr to reference
-                if hasattr(self, 'root') and self.root is not None:
-                    if not hasattr(self.root, 'config'):
-                        self.root.config = a
-                    # Create get_attr node that will serialize as self.config
-                    return self.create_proxy("get_attr", "config", (), {})
-                else:
-                    # If root not available yet, return config as concrete value
-                    # This avoids serialization but config won't be traced
-                    return a
+                # Return as concrete value - this avoids all serialization issues
+                # The config is already on model.config so it will be accessible when needed
+                return a
             
             # For other config objects (shouldn't happen in practice), use a simplified
             # approach: only serialize essential attributes to avoid syntax errors
