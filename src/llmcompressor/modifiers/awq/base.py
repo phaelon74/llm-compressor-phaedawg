@@ -650,7 +650,7 @@ class AWQModifier(Modifier, QuantizationMixin):
 
             # Q(W * s)
             for linear in linears2scale:
-                # FP8 tensors don't support promotion with float32, need to match dtypes
+                # FP8 tensors don't support promotion with float32, need to match dtypes so change it
                 weight_dtype = linear.weight.dtype
                 if weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                     # Convert weight to float32, apply scale, then convert back
