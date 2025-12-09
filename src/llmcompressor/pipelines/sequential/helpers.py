@@ -138,6 +138,11 @@ def trace_subgraphs(
         assert isinstance(model.forward, MethodType)
         assert isinstance(type(model).forward, FunctionType)
 
+        # Ensure config is stored on model for get_attr to work
+        # This must be done before tracing so get_attr nodes can reference it
+        if not hasattr(model, 'config'):
+            model.config = model.config  # Ensure it exists
+        
         with append_autowrap_source_on_fail():
             graph = GraphModule(
                 model,
@@ -194,6 +199,12 @@ class SequentialTracer(HFTracer):
 
         # skip any mask creation functions not already caught by the autowrapper
         super().__init__(autowrap_functions=_get_autowrap_functions())
+        
+        # Ensure model config is accessible for get_attr if model is provided
+        # This must be done before tracing starts
+        if model is not None and hasattr(model, 'config'):
+            # Store reference to model config for get_attr to work
+            self._model_config = model.config
 
         # check unlikely case that ancestors have direct params which are offloaded
         offloaded_ancestors = offloaded & ancestors
@@ -208,15 +219,16 @@ class SequentialTracer(HFTracer):
     def create_arg(self, a: Any) -> Argument:
         # Avoid serializing PretrainedConfig objects to prevent SyntaxError from
         # very long single-line parameter lists, complex nested structures, enums,
-        # and path strings. Return the config as a concrete value to avoid serialization.
+        # and path strings. Use get_attr to reference the config instead of serializing.
         if isinstance(a, PretrainedConfig):
-            # If this is the model's config, return it as a concrete value
+            # If this is the model's config, use get_attr to reference it
             # This avoids the SyntaxError from serialization entirely
-            # The config is already stored on the model and will be accessible at runtime
             if self.model is not None and a is self.model.config:
-                # Return as concrete value - this avoids all serialization issues
-                # The config is already on model.config so it will be accessible when needed
-                return a
+                # The root module is the model itself, so get_attr("config") will work
+                # Create get_attr node - this will serialize as self.config in the generated code
+                # which avoids all serialization issues
+                # Note: root is set by the parent tracer during trace(), so we can safely use get_attr
+                return self.create_proxy("get_attr", "config", (), {})
             
             # For other config objects (shouldn't happen in practice), use a simplified
             # approach: only serialize essential attributes to avoid syntax errors
