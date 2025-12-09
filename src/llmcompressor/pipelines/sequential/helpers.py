@@ -71,6 +71,15 @@ class Subgraph:
             if "Proxy" not in self._code.globals:
                 from torch.fx.proxy import Proxy
                 self._code.globals["Proxy"] = Proxy
+            # Fix get_attr nodes that reference "config" to use "self.config"
+            # This fixes the NameError when config is referenced without self
+            # The issue is that get_attr("config") serializes as just "config" instead of "self.config"
+            import re
+            # Replace bare "config" variable references with "self.config"
+            # Match "config" when it's used as a variable (not part of other words, not already self.config)
+            # Be careful not to replace things like "config =", "config.", "config,", etc.
+            # Pattern: word boundary, "config", followed by whitespace, comma, closing paren, or end of line
+            self._code.src = re.sub(r'(?<!self\.)\bconfig\b(?=\s*[,\)\]\s]|$)', 'self.config', self._code.src)
             exec(self._code.src, self._code.globals)
 
         forward_fn = self._code.globals.get("forward")
@@ -392,6 +401,7 @@ def partition_graph(model: Module, partitions: List[List[Node]]) -> List[Subgrap
     # create subgraphs
     for partition_nodes in partitions:
         # create a new graph for the partition
+        # Note: The root is the model, so get_attr nodes will reference model attributes
         graph = Graph(model)
         node_map = {}
 
