@@ -66,27 +66,31 @@ class Subgraph:
         :return keyword outputs of subgraph forward function (non-consumed variables):
         """
         if self._code is None:
-            # Store model from first argument for get_attr("config") to work
-            # The model is passed as the first argument: subgraph.forward(model, **inputs)
-            if len(args) > 0:
-                self._model = args[0]
-            
             self._code = self.graph.python_code("self")
             # Ensure Proxy is available in globals if needed (for get_attr nodes)
             if "Proxy" not in self._code.globals:
                 from torch.fx.proxy import Proxy
                 self._code.globals["Proxy"] = Proxy
             
-            # Fix get_attr("config") nodes: they serialize as self.config but self is Subgraph, not model
-            # Since model is passed as first arg to forward(), we need to reference model.config
-            # Solution: Replace self.config with self._model.config where self._model is the model
+            # Fix get_attr("config") nodes: they sometimes serialize as bare "config" instead of "self.config"
+            # In the generated code, "self" refers to the model (the root), so self.config should work
+            # The issue is that get_attr("config") serializes incorrectly as just "config"
             import re
-            # Replace self.config with self._model.config to access the model's config
-            if hasattr(self, '_model'):
-                self._code.src = re.sub(r'\bself\.config\b', 'self._model.config', self._code.src)
-                # Also handle bare "config" references that should be model.config
-                # These occur when get_attr serializes incorrectly (just "config" instead of "self.config")
-                self._code.src = re.sub(r'(?<!self\.)(?<!\.)(?<!\w)\bconfig\b(?=\s*[,\)\]])', 'self._model.config', self._code.src)
+            # Replace bare "config" references (not already self.config, not in assignments) with "self.config"
+            # Pattern: config that's not preceded by "self." or word char, and is followed by comma, paren, bracket, or whitespace
+            # But NOT when it's part of an assignment like "config ="
+            lines = self._code.src.split('\n')
+            fixed_lines = []
+            for line in lines:
+                # Skip assignment lines (they should be handled correctly by torch.fx)
+                if re.search(r'\bconfig\s*=', line):
+                    fixed_lines.append(line)
+                else:
+                    # Replace bare config references with self.config
+                    # Match: config not preceded by self. or word char, followed by comma/paren/bracket
+                    fixed_line = re.sub(r'(?<!self\.)(?<!\w)\bconfig\b(?=\s*[,\)\]])', 'self.config', line)
+                    fixed_lines.append(fixed_line)
+            self._code.src = '\n'.join(fixed_lines)
             
             exec(self._code.src, self._code.globals)
 
@@ -439,15 +443,13 @@ def partition_graph(model: Module, partitions: List[List[Node]]) -> List[Subgrap
         # save the subgraph for this partition
         graph.lint()
         input_names = set(node.name for node in graph.nodes if node.op == "placeholder")
-        subgraph = Subgraph(
-            graph=graph,
-            input_names=input_names,
-            consumed_names=set(),  # populated later
+        subgraphs.append(
+            Subgraph(
+                graph=graph,
+                input_names=input_names,
+                consumed_names=set(),  # populated later
+            )
         )
-        # Store model reference on subgraph so get_attr("config") can access model.config
-        # This is needed because get_attr nodes serialize as self.config, but self is the Subgraph
-        subgraph._model = model
-        subgraphs.append(subgraph)
 
         assert graph_is_well_formed(graph)
 
