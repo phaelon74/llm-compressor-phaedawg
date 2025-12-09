@@ -533,19 +533,42 @@ class AWQModifier(Modifier, QuantizationMixin):
                 @torch.no_grad()
                 def _smooth(module):
                     scales = best_scales.to(module.weight.device)
+                    weight_dtype = module.weight.dtype
+                    is_fp8 = weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    
                     if module in balance_layers:
-                        update_offload_parameter(
-                            module,
-                            "weight",
-                            module.weight.mul_(scales.view(1, -1)),
-                        )
-                    elif module == smooth_layer:
-                        if module.weight.ndim == 1:
+                        if is_fp8:
+                            # FP8 doesn't support promotion with float32, convert to float32
+                            weight_fp32 = module.weight.to(torch.float32)
+                            weight_fp32.mul_(scales.view(1, -1))
                             update_offload_parameter(
                                 module,
                                 "weight",
-                                module.weight.div_(scales),
+                                weight_fp32.to(weight_dtype),
                             )
+                        else:
+                            update_offload_parameter(
+                                module,
+                                "weight",
+                                module.weight.mul_(scales.view(1, -1)),
+                            )
+                    elif module == smooth_layer:
+                        if module.weight.ndim == 1:
+                            if is_fp8:
+                                # FP8 doesn't support promotion, convert to float32
+                                weight_fp32 = module.weight.to(torch.float32)
+                                weight_fp32.div_(scales)
+                                update_offload_parameter(
+                                    module,
+                                    "weight",
+                                    weight_fp32.to(weight_dtype),
+                                )
+                            else:
+                                update_offload_parameter(
+                                    module,
+                                    "weight",
+                                    module.weight.div_(scales),
+                                )
                         else:
                             # NOTE: edge case when smooth layer number of out_features
                             # is not equal to balance layer number of in_features
@@ -554,14 +577,31 @@ class AWQModifier(Modifier, QuantizationMixin):
                             # because the desired smooth layer is v_proj
                             # https://github.com/casper-hansen/AutoAWQ/blob/main/awq/quantize/scale.py#L123
                             weight = module.weight
-                            weight[-scales.size(0) :].div_(scales.view(-1, 1))
+                            if is_fp8:
+                                # FP8 doesn't support promotion, convert to float32
+                                weight_fp32 = weight.to(torch.float32)
+                                weight_fp32[-scales.size(0) :].div_(scales.view(-1, 1))
+                                weight = weight_fp32.to(weight_dtype)
+                            else:
+                                weight[-scales.size(0) :].div_(scales.view(-1, 1))
                             update_offload_parameter(module, "weight", weight)
                         if hasattr(module, "bias") and module.bias is not None:
-                            update_offload_parameter(
-                                module,
-                                "bias",
-                                module.bias.div_(scales),
-                            )
+                            # Bias is typically not FP8, but handle it just in case
+                            bias_dtype = module.bias.dtype
+                            if bias_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                                bias_fp32 = module.bias.to(torch.float32)
+                                bias_fp32.div_(scales)
+                                update_offload_parameter(
+                                    module,
+                                    "bias",
+                                    bias_fp32.to(bias_dtype),
+                                )
+                            else:
+                                update_offload_parameter(
+                                    module,
+                                    "bias",
+                                    module.bias.div_(scales),
+                                )
 
                 parent = get_fsdp_parent(mapping.smooth_name, model)
                 if parent is not None:
