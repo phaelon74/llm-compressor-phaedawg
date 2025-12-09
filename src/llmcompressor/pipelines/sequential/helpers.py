@@ -72,16 +72,37 @@ class Subgraph:
                 from torch.fx.proxy import Proxy
                 self._code.globals["Proxy"] = Proxy
             
-            # Fix get_attr("config") nodes: they sometimes serialize as bare "config" instead of "self.config"
-            # In the generated code, "self" refers to the model (the root), so self.config should work
-            # The issue is that get_attr("config") serializes incorrectly as just "config"
+            # Fix get_attr("config") nodes: they serialize incorrectly
+            # The issue is that get_attr("config") creates nodes that serialize as:
+            # 1. Bare "config" variable references (should be "self.config")
+            # 2. Assignment statements like "config = Proxy(config)" in function args (invalid syntax)
             import re
-            # Replace ALL bare "config" references with "self.config"
-            # Be very aggressive - replace config anywhere it appears as a bare variable
-            # Pattern: config that's not already self.config and not part of other words
-            # Replace ALL occurrences of bare "config" (not preceded by "self." or word char)
-            # This handles: function args, variable references, etc.
-            self._code.src = re.sub(r'(?<!self\.)(?<!\w)\bconfig\b', 'self.config', self._code.src)
+            
+            # First, handle assignment statements that appear in function arguments
+            # These are invalid syntax: "config = Proxy(...)" or "self.config = Proxy(...)" as function args
+            # Replace entire assignment with just "self.config" (the value)
+            # Match: (self.)?config = Proxy(anything including nested parentheses)
+            # Use a more robust pattern that handles nested Proxy calls
+            self._code.src = re.sub(
+                r'\b(self\.)?config\s*=\s*Proxy\([^)]*(?:\([^)]*\)[^)]*)*\)',
+                'self.config',
+                self._code.src
+            )
+            
+            # Also handle simpler case: config = Proxy(config) or self.config = Proxy(self.config)
+            self._code.src = re.sub(
+                r'\b(self\.)?config\s*=\s*Proxy\(self\.config\)',
+                'self.config',
+                self._code.src
+            )
+            
+            # Then replace remaining bare "config" references with "self.config"
+            # Pattern: word boundary "config" not preceded by "self." or word char, not followed by "="
+            self._code.src = re.sub(
+                r'(?<!self\.)(?<!\w)\bconfig\b(?!\s*=)',
+                'self.config',
+                self._code.src
+            )
             
             exec(self._code.src, self._code.globals)
 
