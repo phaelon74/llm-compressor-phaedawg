@@ -76,10 +76,24 @@ class Subgraph:
             # The issue is that get_attr("config") serializes as just "config" instead of "self.config"
             import re
             # Replace bare "config" variable references with "self.config"
-            # Match "config" when it's used as a variable (not part of other words, not already self.config)
-            # Be careful not to replace things like "config =", "config.", "config,", etc.
-            # Pattern: word boundary, "config", followed by whitespace, comma, closing paren, or end of line
-            self._code.src = re.sub(r'(?<!self\.)\bconfig\b(?=\s*[,\)\]\s]|$)', 'self.config', self._code.src)
+            # But be careful: don't replace in assignments like "config = ..." or "self.config = ..."
+            # Pattern: Replace "config" when it's used as a variable (not in assignment, not already self.config)
+            # Match: word boundary "config" not preceded by "self." or assignment, 
+            # followed by comma, closing paren, or whitespace (but not equals for assignment)
+            lines = self._code.src.split('\n')
+            fixed_lines = []
+            for line in lines:
+                # Skip lines that are assignments to config (they'll be handled by get_attr properly)
+                if re.search(r'\bconfig\s*=', line) and 'self.config' not in line:
+                    # This is an assignment - replace the assignment target but keep the pattern
+                    # Actually, torch.fx should handle get_attr assignments correctly, so leave them
+                    fixed_lines.append(line)
+                else:
+                    # Replace bare config references (not assignments, not self.config)
+                    # Match config when it's used as a variable reference
+                    fixed_line = re.sub(r'(?<!self\.)(?<!\w)\bconfig\b(?=\s*[,\)\]])', 'self.config', line)
+                    fixed_lines.append(fixed_line)
+            self._code.src = '\n'.join(fixed_lines)
             exec(self._code.src, self._code.globals)
 
         forward_fn = self._code.globals.get("forward")
