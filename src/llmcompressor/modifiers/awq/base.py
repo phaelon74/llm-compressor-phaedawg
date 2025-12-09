@@ -650,18 +650,39 @@ class AWQModifier(Modifier, QuantizationMixin):
 
             # Q(W * s)
             for linear in linears2scale:
-                linear.weight.mul_(_scalesview)
-                update_offload_parameter(
-                    linear,
-                    "weight",
-                    _pseudo_quantize_tensor(
-                        w=linear.weight.data,
+                # FP8 tensors don't support promotion with float32, need to match dtypes
+                weight_dtype = linear.weight.dtype
+                if weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    # Convert weight to float32, apply scale, then convert back
+                    weight_fp32 = linear.weight.to(torch.float32)
+                    weight_fp32.mul_(_scalesview)
+                    linear.weight.data = weight_fp32.to(weight_dtype)
+                    # For pseudo quantization, use the float32 version
+                    quantized_weight_fp32 = _pseudo_quantize_tensor(
+                        w=weight_fp32,
                         symmetric=self._symmetric,
                         bit_width=self._num_bits,
                         group_size=self._group_size,
-                    )[0]
-                    / _scalesview,
-                )
+                    )[0] / _scalesview
+                    # Convert back to FP8 for storage
+                    update_offload_parameter(
+                        linear,
+                        "weight",
+                        quantized_weight_fp32.to(weight_dtype),
+                    )
+                else:
+                    linear.weight.mul_(_scalesview)
+                    update_offload_parameter(
+                        linear,
+                        "weight",
+                        _pseudo_quantize_tensor(
+                            w=linear.weight.data,
+                            symmetric=self._symmetric,
+                            bit_width=self._num_bits,
+                            group_size=self._group_size,
+                        )[0]
+                        / _scalesview,
+                    )
 
             # W * X
             int_w_outputs = self._run_samples(parent_module)
