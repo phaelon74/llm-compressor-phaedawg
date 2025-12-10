@@ -89,7 +89,17 @@ class MinMaxObserver(MovingAverageObserverBase):
 
 
 def _get_min_max(observed: torch.Tensor) -> MinMaxTuple:
+    # FP8 tensors don't support amin/amax operations, convert to float32
+    original_dtype = observed.dtype
+    if original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        observed = observed.to(torch.float32)
+    
     min_vals = torch.amin(observed, dim=(0, -1))
     max_vals = torch.amax(observed, dim=(0, -1))
+    
+    # Convert back to original dtype if needed (though min/max are typically used in float32)
+    if original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        min_vals = min_vals.to(original_dtype)
+        max_vals = max_vals.to(original_dtype)
 
     return min_vals, max_vals
