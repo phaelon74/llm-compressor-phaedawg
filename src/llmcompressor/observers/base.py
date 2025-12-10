@@ -108,6 +108,13 @@ class Observer(InternalModule, RegistryMixin):
         observed = flatten_for_calibration(observed, self.base_name, self.args, g_idx)
         min_vals, max_vals = self.get_min_max(observed)
 
+        # compressed_tensors' calculate_qparams doesn't support FP8, convert to float32
+        # The min/max values are used for quantization parameters which are typically float32
+        if min_vals.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            min_vals = min_vals.to(torch.float32)
+        if max_vals.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            max_vals = max_vals.to(torch.float32)
+
         scales, zero_points = calculate_qparams(
             min_vals=min_vals,
             max_vals=max_vals,
@@ -122,6 +129,13 @@ class Observer(InternalModule, RegistryMixin):
         observed = observed.reshape((1, 1, -1))  # per tensor reshape
 
         global_min_vals, global_max_vals = self.get_global_min_max(observed)
+        
+        # compressed_tensors' generate_gparam may not support FP8, convert to float32
+        if global_min_vals.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            global_min_vals = global_min_vals.to(torch.float32)
+        if global_max_vals.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            global_max_vals = global_max_vals.to(torch.float32)
+        
         global_scale = generate_gparam(global_min_vals, global_max_vals)
 
         return global_scale, global_min_vals, global_max_vals
