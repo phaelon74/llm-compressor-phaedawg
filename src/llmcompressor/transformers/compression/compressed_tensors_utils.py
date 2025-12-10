@@ -87,6 +87,15 @@ def modify_save_pretrained(model: PreTrainedModel):
                 disable_sparse_compression=disable_sparse_compression,
             )
             if compressor is not None:
+                # FP8 weights don't support promotion with float16 scales during quantization
+                # Convert FP8 weights to float32 before compression
+                # compressed_tensors will quantize them to the target format (e.g., int4)
+                for name, param in model.named_parameters():
+                    if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                        # Convert FP8 to float32 for quantization
+                        # After compression, weights will be quantized to target dtype (e.g., int4)
+                        param.data = param.data.to(torch.float32)
+                
                 compressor.compress_model(model)
 
             # save (compressed) model structure
